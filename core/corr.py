@@ -214,7 +214,7 @@ class CPUCostVolume:
             corr_list.append(corr)
 
         # Upsample all correlation volumes to the GRU resolution (H/8, W/8) and concatenate
-        H_base, W_base = self.fmap1.shape[2] // 8, self.fmap1.shape[3] // 8
+        H_base, W_base = self.fmap1.shape[2] // 8, self.fmap1.shape[3]
         
         final_corr_list = []
         for corr in corr_list:
