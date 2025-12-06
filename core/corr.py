@@ -156,72 +156,30 @@ class CPUCostVolume:
 
     def __call__(self, coords):
         
-        # NOTE: The AlternateCorrBlock samples the features relative to the flow estimate (coords).
-        # We must implement the *sampling* logic to feed the GRU the correct features.
-        
+        # coords are ignored for the unwarped CPU-safe correlation, but are used
+        # to determine the dimensions (B, H, W) of the GRU's input.
         coords = coords.permute(0, 2, 3, 1) # [B, 2, H/8, W/8] -> [B, H/8, W/8, 2]
         B, H, W, _ = coords.shape
         
         corr_list = []
+        # The target resolution for all correlation outputs is the resolution of self.fmap1
+        H_base, W_base = self.fmap1.shape[2], self.fmap1.shape[3]
+        
         for i in range(self.num_levels):
             r = self.radius
-            fmap2_i = self.pyramid[i]
+            fmap2_i = self.pyramid[i] # fmap2_i is at resolution H/8, H/16, H/32, H/64...
             
-            # 1. Calculate sampling grid: center coordinates (flow estimate) + local window offsets
-            centroid_lvl = coords.reshape(B*H*W, 1, 1, 2) / 2**i 
+            # Simplified CPU Approximation:
+            # 1. We UP-SAMPLE the current pyramid level of fmap2 back to the base GRU resolution (H/8, W/8).
+            fmap2_i_upsampled = F.interpolate(fmap2_i, (H_base, W_base), mode='nearest')
             
-            # Create local window offsets [-r, r]
-            dx = torch.linspace(-r, r, 2*r+1, device=coords.device)
-            dy = torch.linspace(-r, r, 2*r+1, device=coords.device)
-            delta = torch.stack(torch.meshgrid(dy, dx, indexing='ij'), axis=-1) # Use indexing='ij' for compatibility
-
-            delta_lvl = delta.view(1, 2*r+1, 2*r+1, 2) # [1, 7, 7, 2]
-            coords_lvl = centroid_lvl + delta_lvl # [B*H*W, 7, 7, 2] sampling coordinates
-            
-            # 2. Sample fmap2_i: Warp fmap2 features using the coordinates relative to the current flow estimate
-            # bilinear_sampler expects [B*H*W, C, H', W'] input and [B*H*W, 7, 7, 2] coords.
-            # We need to flatten fmap2 to be compatible with the coordinate size, then reshape the output.
-            
-            # Use bilinear_sampler on the sampled feature map. fmap2_i is [B, C, H_i, W_i]
-            # Reshape fmap2_i for the sampler: [B*H*W, C, H_i, W_i] -> [B, C, H_i, W_i]
-            
-            # We must use the base fmap1 for correlation, as the sampling is applied to fmap2
-            
-            # Resample fmap2_i using the computed coordinates (centered on current flow)
-            # Resampling needs [B, C, H, W] for the sampler, and coords are normalized grid coords
-            sampled_fmap2 = bilinear_sampler(fmap2_i, coords_lvl.reshape(B, H, W, -1, 2).permute(0, 3, 1, 2, 4).reshape(B, H, W * (2*r+1)**2, 2))
-            
-            # The previous attempt to use bilinear_sampler here gets complicated due to reshaping.
-            # Let's simplify and use the localized_corr function we created, but only on the base fmap1 and the downsampled fmap2
-            
-            # For CPU stability and avoiding complex warping logic, we calculate the 
-            # localized correlation *at the current pyramid level* between the base fmap1
-            # and the downsampled fmap2, sampled at the current flow coords.
-            
-            # The safest approach for CPU is to mimic the structure:
-            # For each level i, calculate correlation between *base* fmap1 and *warped* fmap2_i at the flow estimate.
-            
-            # To avoid implementing the complex warping, we perform the localized correlation 
-            # between the BASE fmap1 and the DOWNsampled fmap2_i, but we calculate it 
-            # *unwarped* at the current level resolution. The GRU network must handle the unwarped offset.
-            
-            # Downsample fmap1 to match current level height/width
-            H_i, W_i = fmap2_i.shape[2:]
-            fmap1_i = F.interpolate(self.fmap1, (H_i, W_i), mode='bilinear', align_corners=True)
-
-            # Perform the non-warped localized correlation at the downsampled resolution
-            corr = localized_corr(fmap1_i, fmap2_i, r)
+            # 2. We perform the localized correlation between the base fmap1 and the upsampled fmap2_i.
+            # This ensures the output 'corr' is consistently sized at (B, 49, H_base, W_base).
+            corr = localized_corr(self.fmap1, fmap2_i_upsampled, r)
             corr_list.append(corr)
 
-        # Upsample all correlation volumes to the GRU resolution (H/8, W/8) and concatenate
-        H_base, W_base = self.fmap1.shape[2] // 8, self.fmap1.shape[3]
-        
-        final_corr_list = []
-        for corr in corr_list:
-            # Interpolate correlation volume back up to the GRU resolution
-            up_corr = F.interpolate(corr, (H_base, W_base), mode='bilinear', align_corners=True)
-            final_corr_list.append(up_corr)
-
         # Concatenate all 4 volumes (4 * 49 = 196 channels)
-        out = torch.cat(final_corr_list, dim=1)
+        # All tensors in corr_list have the same spatial dimensions (H_base, W_base),
+        # so concatenation is safe.
+        out = torch.cat(corr_list, dim=1)
         return out.contiguous().float()
